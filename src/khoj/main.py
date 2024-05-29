@@ -1,50 +1,105 @@
-# Standard Packages
+""" Main module for Khoj Assistant
+   isort:skip_file
+"""
+
+from contextlib import redirect_stdout
+import logging
+import io
 import os
-import signal
+import atexit
 import sys
 import locale
 
-if sys.stdout is None:
-    sys.stdout = open(os.devnull, "w")
-if sys.stderr is None:
-    sys.stderr = open(os.devnull, "w")
-
-import logging
+from rich.logging import RichHandler
 import threading
 import warnings
-from platform import system
-import webbrowser
+from importlib.metadata import version
+
+from khoj.utils.helpers import in_debug_mode, is_env_var_true
 
 # Ignore non-actionable warnings
 warnings.filterwarnings("ignore", message=r"snapshot_download.py has been made private", category=FutureWarning)
 warnings.filterwarnings("ignore", message=r"legacy way to download files from the HF hub,", category=FutureWarning)
 
-# External Packages
+
 import uvicorn
+import django
+from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI
-from rich.logging import RichHandler
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import schedule
 
-# Internal Packages
-from khoj.configure import configure_routes, initialize_server
-from khoj.utils import state
-from khoj.utils.cli import cli
+from django.core.asgi import get_asgi_application
+from django.core.management import call_command
+
+# Initialize Django
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "khoj.app.settings")
+django.setup()
+
+# Setup Logger
+rich_handler = RichHandler(rich_tracebacks=True)
+rich_handler.setFormatter(fmt=logging.Formatter(fmt="%(name)s: %(message)s", datefmt="[%H:%M:%S.%f]"))
+logging.basicConfig(handlers=[rich_handler])
+
+logging.getLogger("uvicorn.error").setLevel(logging.INFO)
+
+logger = logging.getLogger("khoj")
+
+# Initialize Django Database
+db_migrate_output = io.StringIO()
+with redirect_stdout(db_migrate_output):
+    call_command("migrate", "--noinput")
+
+# Initialize Django Static Files
+collectstatic_output = io.StringIO()
+with redirect_stdout(collectstatic_output):
+    call_command("collectstatic", "--noinput")
 
 # Initialize the Application Server
-app = FastAPI()
+if in_debug_mode():
+    app = FastAPI(debug=True)
+else:
+    app = FastAPI(docs_url=None)  # Disable Swagger UI in production
+
+# Get Django Application
+django_app = get_asgi_application()
+
+# Add CORS middleware
+KHOJ_DOMAIN = os.getenv("KHOJ_DOMAIN", "app.khoj.dev")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "app://obsidian.md",
+        "capacitor://localhost",  # To allow access from Obsidian iOS app using Capacitor.JS
+        "http://localhost",  # To allow access from Obsidian Android app
+        "http://localhost:*",
+        "http://127.0.0.1:*",
+        f"https://{KHOJ_DOMAIN}" if not is_env_var_true("KHOJ_NO_HTTPS") else f"http://{KHOJ_DOMAIN}",
+        f"https://{KHOJ_DOMAIN}:*" if not is_env_var_true("KHOJ_NO_HTTPS") else f"http://{KHOJ_DOMAIN}:*",
+        "app://khoj.dev",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Set Locale
 locale.setlocale(locale.LC_ALL, "")
 
-# Setup Logger
-rich_handler = RichHandler(rich_tracebacks=True)
-rich_handler.setFormatter(fmt=logging.Formatter(fmt="%(message)s", datefmt="[%X]"))
-logging.basicConfig(handlers=[rich_handler])
+# We import these packages after setting up Django so that Django features are accessible to the app.
+from khoj.configure import configure_routes, initialize_server, configure_middleware
+from khoj.utils import state
+from khoj.utils.cli import cli
+from khoj.utils.initialization import initialization
 
-logger = logging.getLogger("khoj")
+
+def shutdown_scheduler():
+    logger.info("🌑 Shutting down Khoj")
+    state.scheduler.shutdown()
 
 
-def run():
+def run(should_start_server=True):
     # Turn Tokenizers Parallelism Off. App does not support it.
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -53,14 +108,20 @@ def run():
     args = cli(state.cli_args)
     set_state(args)
 
-    # Create app directory, if it doesn't exist
-    state.config_file.parent.mkdir(parents=True, exist_ok=True)
-
     # Set Logging Level
     if args.verbose == 0:
         logger.setLevel(logging.INFO)
     elif args.verbose >= 1:
         logger.setLevel(logging.DEBUG)
+
+    logger.info(f"🚒 Initializing Khoj v{state.khoj_version}")
+    logger.info(f"📦 Initializing DB:\n{db_migrate_output.getvalue().strip()}")
+    logger.debug(f"🌍 Initializing Web Client:\n{collectstatic_output.getvalue().strip()}")
+
+    initialization()
+
+    # Create app directory, if it doesn't exist
+    state.config_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Set Log File
     fh = logging.FileHandler(state.config_file.parent / "khoj.log", encoding="utf-8")
@@ -69,81 +130,42 @@ def run():
 
     logger.info("🌘 Starting Khoj")
 
-    if not args.gui:
-        # Setup task scheduler
-        poll_task_scheduler()
+    # Setup task scheduler
+    poll_task_scheduler()
 
-        # Start Server
-        initialize_server(args.config, args.regenerate, required=False)
-        configure_routes(app)
+    # Setup Background Scheduler
+    from django_apscheduler.jobstores import DjangoJobStore
+
+    state.scheduler = BackgroundScheduler(
+        {
+            "apscheduler.timezone": "UTC",
+            "apscheduler.job_defaults.misfire_grace_time": "60",  # Useful to run scheduled jobs even when worker delayed because it was busy or down
+            "apscheduler.job_defaults.coalesce": "true",  # Combine multiple jobs into one if they are scheduled at the same time
+        }
+    )
+    state.scheduler.add_jobstore(DjangoJobStore(), "default")
+    state.scheduler.start()
+
+    # Start Server
+    configure_routes(app)
+
+    #  Mount Django and Static Files
+    app.mount("/server", django_app, name="server")
+    static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+    if not os.path.exists(static_dir):
+        os.mkdir(static_dir)
+    app.mount(f"/static", StaticFiles(directory=static_dir), name=static_dir)
+
+    # Configure Middleware
+    configure_middleware(app)
+
+    initialize_server(args.config)
+
+    # If the server is started through gunicorn (external to the script), don't start the server
+    if should_start_server:
         start_server(app, host=args.host, port=args.port, socket=args.socket)
-    else:
-        from PySide6 import QtWidgets
-        from PySide6.QtCore import QTimer
-
-        from khoj.interface.desktop.main_window import MainWindow, ServerThread
-        from khoj.interface.desktop.system_tray import create_system_tray
-
-        # Setup GUI
-        gui = QtWidgets.QApplication([])
-        main_window = MainWindow(args.host, args.port)
-
-        # System tray is only available on Windows, MacOS.
-        # On Linux (Gnome) the System tray is not supported.
-        # Since only the Main Window is available
-        # Quitting it should quit the application
-        if system() in ["Windows", "Darwin"]:
-            gui.setQuitOnLastWindowClosed(False)
-            tray = create_system_tray(gui, main_window)
-            tray.show()
-
-        # Setup Server
-        initialize_server(args.config, args.regenerate, required=False)
-        configure_routes(app)
-        server = ServerThread(start_server_func=lambda: start_server(app, host=args.host, port=args.port), parent=gui)
-
-        url = f"http://{args.host}:{args.port}"
-        logger.info(f"🌗 Khoj is running at {url}")
-        try:
-            startup_url = url if args.config else f"{url}/config"
-            webbrowser.open(startup_url)
-        except:
-            logger.warning(f"🚧 Unable to open browser. Please open {url} manually to configure or use Khoj.")
-
-        # Show Main Window on First Run Experience or if on Linux
-        if args.config is None or system() not in ["Windows", "Darwin"]:
-            main_window.show()
-
-        # Setup Signal Handlers
-        signal.signal(signal.SIGINT, sigint_handler)
-        # Invoke Python interpreter every 500ms to handle signals, run scheduled tasks
-        timer = QTimer()
-        timer.start(500)
-        timer.timeout.connect(schedule.run_pending)
-
-        # Start Application
-        server.start()
-        gui.aboutToQuit.connect(server.exit)
-
-        # Close Splash Screen if still open
-        if system() != "Darwin":
-            try:
-                import pyi_splash
-
-                # Update the text on the splash screen
-                pyi_splash.update_text("Khoj setup complete")
-                # Close Splash Screen
-                pyi_splash.close()
-            except:
-                pass
-
-        gui.exec()
-
-
-def sigint_handler(*args):
-    from PySide6 import QtWidgets
-
-    QtWidgets.QApplication.quit()
+        # Teardown
+        shutdown_scheduler()
 
 
 def set_state(args):
@@ -152,7 +174,9 @@ def set_state(args):
     state.verbose = args.verbose
     state.host = args.host
     state.port = args.port
-    state.demo = args.demo
+    state.anonymous_mode = args.anonymous_mode
+    state.khoj_version = version("khoj-assistant")
+    state.chat_on_gpu = args.chat_on_gpu
 
 
 def start_server(app, host=None, port=None, socket=None):
@@ -160,7 +184,15 @@ def start_server(app, host=None, port=None, socket=None):
     if socket:
         uvicorn.run(app, proxy_headers=True, uds=socket, log_level="debug", use_colors=True, log_config=None)
     else:
-        uvicorn.run(app, host=host, port=port, log_level="debug", use_colors=True, log_config=None)
+        uvicorn.run(
+            app,
+            host=host,
+            port=port,
+            log_level="debug" if state.verbose > 1 else "info",
+            use_colors=True,
+            log_config=None,
+            timeout_keep_alive=60,
+        )
     logger.info("🌒 Stopping Khoj")
 
 
@@ -171,10 +203,8 @@ def poll_task_scheduler():
     schedule.run_pending()
 
 
-def run_gui():
-    sys.argv += ["--gui"]
-    run()
-
-
 if __name__ == "__main__":
-    run_gui()
+    run()
+else:
+    run(should_start_server=False)
+    atexit.register(shutdown_scheduler)

@@ -1,7 +1,9 @@
 {
     "name": "Khoj",
-    "version": "0.11.1",
-    "description": "An AI Personal Assistant for your Digital Brain",
+    "version": "1.12.1",
+    "description": "An AI copilot for your Second Brain",
+    "author": "Debanjum Singh Solanky, Saba Imran <team@khoj.dev>",
+    "license": "GPL-3.0-or-later",
     "main": "src/main.js",
     "scripts": {
         "dev": "node esbuild.config.mjs",
@@ -14,8 +16,6 @@
         "AI",
         "assistant"
     ],
-    "author": "Debanjum Singh Solanky",
-    "license": "GPL-3.0-or-later",
     "devDependencies": {
         "@types/node": "^16.11.6",
         "@typescript-eslint/eslint-plugin": "5.29.0",
@@ -25,9 +25,5 @@
         "obsidian": "latest",
         "tslib": "2.4.0",
         "typescript": "4.7.4"
-    },
-    "dependencies": {
-        "@types/node-fetch": "^2.6.4",
-        "node-fetch": "^3.1.0"
     }
 }

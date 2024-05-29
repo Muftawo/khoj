@@ -1,16 +1,22 @@
-# Standard Packages
 import os
 from datetime import datetime
 
-# External Packages
-import pytest
 import freezegun
+import pytest
 from freezegun import freeze_time
 
-# Internal Packages
 from khoj.processor.conversation.openai.gpt import converse, extract_questions
 from khoj.processor.conversation.utils import message_to_log
-
+from khoj.routers.helpers import (
+    aget_relevant_information_sources,
+    aget_relevant_output_modes,
+    generate_online_subqueries,
+    infer_webpage_urls,
+    schedule_query,
+    should_notify,
+)
+from khoj.utils.helpers import ConversationCommand
+from khoj.utils.rawconfig import LocationData
 
 # Initialize variables for tests
 api_key = os.getenv("OPENAI_API_KEY")
@@ -26,7 +32,7 @@ freezegun.configure(extend_ignore_list=["transformers"])
 # Test
 # ----------------------------------------------------------------------------------------------------
 @pytest.mark.chatquality
-@freeze_time("1984-04-02")
+@freeze_time("1984-04-02", ignore=["transformers"])
 def test_extract_question_with_date_filter_from_relative_day():
     # Act
     response = extract_questions("Where did I go for dinner yesterday?")
@@ -45,7 +51,7 @@ def test_extract_question_with_date_filter_from_relative_day():
 
 # ----------------------------------------------------------------------------------------------------
 @pytest.mark.chatquality
-@freeze_time("1984-04-02")
+@freeze_time("1984-04-02", ignore=["transformers"])
 def test_extract_question_with_date_filter_from_relative_month():
     # Act
     response = extract_questions("Which countries did I visit last month?")
@@ -60,7 +66,7 @@ def test_extract_question_with_date_filter_from_relative_month():
 
 # ----------------------------------------------------------------------------------------------------
 @pytest.mark.chatquality
-@freeze_time("1984-04-02")
+@freeze_time("1984-04-02", ignore=["transformers"])
 def test_extract_question_with_date_filter_from_relative_year():
     # Act
     response = extract_questions("Which countries have I visited this year?")
@@ -155,33 +161,6 @@ def test_generate_search_query_using_question_and_answer_from_chat_history():
     # Assert
     assert len(response) == 1
     assert "Leia" in response[0] and "Luke" in response[0]
-
-
-# ----------------------------------------------------------------------------------------------------
-@pytest.mark.chatquality
-def test_generate_search_query_with_date_and_context_from_chat_history():
-    # Arrange
-    message_list = [
-        ("When did I visit Masai Mara?", "You visited Masai Mara in April 2000", []),
-    ]
-
-    # Act
-    response = extract_questions(
-        "What was the Pizza place we ate at over there?", conversation_log=populate_chat_history(message_list)
-    )
-
-    # Assert
-    expected_responses = [
-        ("dt>='2000-04-01'", "dt<'2000-05-01'"),
-        ("dt>='2000-04-01'", "dt<='2000-04-30'"),
-        ('dt>="2000-04-01"', 'dt<"2000-05-01"'),
-        ('dt>="2000-04-01"', 'dt<="2000-04-30"'),
-    ]
-    assert len(response) == 1
-    assert "Masai Mara" in response[0]
-    assert any([start in response[0] and end in response[0] for start, end in expected_responses]), (
-        "Expected date filter to limit to April 2000 in response but got: " + response[0]
-    )
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -394,7 +373,7 @@ def test_answer_general_question_not_in_chat_history_or_retrieved_content():
     # Act
     response_gen = converse(
         references=[],  # Assume no context retrieved from notes for the user_query
-        user_query="Write a haiku about unit testing in 3 lines",
+        user_query="Write a haiku about unit testing in 3 lines. Do not say anything else",
         conversation_log=populate_chat_history(message_list),
         api_key=api_key,
     )
@@ -436,6 +415,232 @@ My sister, Aiyla is married to Tolga. They have 3 kids, Yildiz, Ali and Ahmet.""
     assert any([expected_response in response for expected_response in expected_responses]), (
         "Expected chat actor to ask for clarification in response, but got: " + response
     )
+
+
+# ----------------------------------------------------------------------------------------------------
+@pytest.mark.chatquality
+def test_agent_prompt_should_be_used(openai_agent):
+    "Chat actor should ask be tuned to think like an accountant based on the agent definition"
+    # Arrange
+    context = [
+        f"""I went to the store and bought some bananas for 2.20""",
+        f"""I went to the store and bought some apples for 1.30""",
+        f"""I went to the store and bought some oranges for 6.00""",
+    ]
+    expected_responses = ["9.50", "9.5"]
+
+    # Act
+    response_gen = converse(
+        references=context,  # Assume context retrieved from notes for the user_query
+        user_query="What did I buy?",
+        api_key=api_key,
+    )
+    no_agent_response = "".join([response_chunk for response_chunk in response_gen])
+    response_gen = converse(
+        references=context,  # Assume context retrieved from notes for the user_query
+        user_query="What did I buy?",
+        api_key=api_key,
+        agent=openai_agent,
+    )
+    agent_response = "".join([response_chunk for response_chunk in response_gen])
+
+    # Assert that the model without the agent prompt does not include the summary of purchases
+    assert all([expected_response not in no_agent_response for expected_response in expected_responses]), (
+        "Expected chat actor to summarize values of purchases" + no_agent_response
+    )
+    assert any([expected_response in agent_response for expected_response in expected_responses]), (
+        "Expected chat actor to summarize values of purchases" + agent_response
+    )
+
+
+# ----------------------------------------------------------------------------------------------------
+@pytest.mark.anyio
+@pytest.mark.django_db(transaction=True)
+@freeze_time("2024-04-04", ignore=["transformers"])
+async def test_websearch_with_operators(chat_client):
+    # Arrange
+    user_query = "Share popular posts on r/worldnews this month"
+
+    # Act
+    responses = await generate_online_subqueries(user_query, {}, None)
+
+    # Assert
+    assert any(
+        ["reddit.com/r/worldnews" in response for response in responses]
+    ), "Expected a search query to include site:reddit.com but got: " + str(responses)
+
+    assert any(
+        ["site:reddit.com" in response for response in responses]
+    ), "Expected a search query to include site:reddit.com but got: " + str(responses)
+
+
+# ----------------------------------------------------------------------------------------------------
+@pytest.mark.anyio
+@pytest.mark.django_db(transaction=True)
+async def test_websearch_khoj_website_for_info_about_khoj(chat_client):
+    # Arrange
+    user_query = "Do you support image search?"
+
+    # Act
+    responses = await generate_online_subqueries(user_query, {}, None)
+
+    # Assert
+    assert any(
+        ["site:khoj.dev" in response for response in responses]
+    ), "Expected search query to include site:khoj.dev but got: " + str(responses)
+
+
+# ----------------------------------------------------------------------------------------------------
+@pytest.mark.anyio
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    "user_query, expected_mode",
+    [
+        ("What's the latest in the Israel/Palestine conflict?", "default"),
+        ("Summarize the latest tech news every Monday evening", "reminder"),
+        ("Paint a scenery in Timbuktu in the winter", "image"),
+        ("Remind me, when did I last visit the Serengeti?", "default"),
+    ],
+)
+async def test_use_default_response_mode(chat_client, user_query, expected_mode):
+    # Act
+    mode = await aget_relevant_output_modes(user_query, {})
+
+    # Assert
+    assert mode.value == expected_mode
+
+
+# ----------------------------------------------------------------------------------------------------
+@pytest.mark.anyio
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    "user_query, expected_conversation_commands",
+    [
+        ("Where did I learn to swim?", [ConversationCommand.Notes]),
+        ("Where is the nearest hospital?", [ConversationCommand.Online]),
+        ("Summarize the wikipedia page on the history of the internet", [ConversationCommand.Webpage]),
+    ],
+)
+async def test_select_data_sources_actor_chooses_to_search_notes(
+    chat_client, user_query, expected_conversation_commands
+):
+    # Act
+    conversation_commands = await aget_relevant_information_sources(user_query, {})
+
+    # Assert
+    assert expected_conversation_commands in conversation_commands
+
+
+# ----------------------------------------------------------------------------------------------------
+@pytest.mark.anyio
+@pytest.mark.django_db(transaction=True)
+async def test_infer_webpage_urls_actor_extracts_correct_links(chat_client):
+    # Arrange
+    user_query = "Summarize the wikipedia page on the history of the internet"
+
+    # Act
+    urls = await infer_webpage_urls(user_query, {}, None)
+
+    # Assert
+    assert "https://en.wikipedia.org/wiki/History_of_the_Internet" in urls
+
+
+# ----------------------------------------------------------------------------------------------------
+@pytest.mark.anyio
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    "user_query, location, expected_crontime, expected_qs, unexpected_qs",
+    [
+        (
+            "Share the weather forecast for the next day daily at 7:30pm",
+            ("Ubud", "Bali", "Indonesia"),
+            "30 11 * * *",  # ensure correctly converts to utc
+            ["weather forecast", "ubud"],
+            ["7:30"],
+        ),
+        (
+            "Notify me when the new President of Brazil is announced",
+            ("Sao Paulo", "Sao Paulo", "Brazil"),
+            "* *",  # crontime is variable
+            ["brazil", "president"],
+            ["notify"],  # ensure reminder isn't re-triggered on scheduled query run
+        ),
+        (
+            "Let me know whenever Elon leaves Twitter. Check this every afternoon at 12",
+            ("Karachi", "Sindh", "Pakistan"),
+            "0 7 * * *",  # ensure correctly converts to utc
+            ["elon", "twitter"],
+            ["12"],
+        ),
+        (
+            "Draw a wallpaper every morning using the current weather",
+            ("Bogota", "Cundinamarca", "Colombia"),
+            "* * *",  # daily crontime
+            ["weather", "wallpaper", "bogota"],
+            ["every"],
+        ),
+    ],
+)
+async def test_infer_task_scheduling_request(
+    chat_client, user_query, location, expected_crontime, expected_qs, unexpected_qs
+):
+    # Arrange
+    location_data = LocationData(city=location[0], region=location[1], country=location[2])
+
+    # Act
+    crontime, inferred_query = await schedule_query(user_query, location_data, {})
+    inferred_query = inferred_query.lower()
+
+    # Assert
+    assert expected_crontime in crontime
+    for expected_q in expected_qs:
+        assert expected_q in inferred_query, f"Expected fragment {expected_q} in query: {inferred_query}"
+    for unexpected_q in unexpected_qs:
+        assert (
+            unexpected_q not in inferred_query
+        ), f"Did not expect fragment '{unexpected_q}' in query: '{inferred_query}'"
+
+
+# ----------------------------------------------------------------------------------------------------
+@pytest.mark.anyio
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    "scheduling_query, executing_query, generated_response, expected_should_notify",
+    [
+        (
+            "Notify me if it is going to rain tomorrow?",
+            "What's the weather forecast for tomorrow?",
+            "It is sunny and warm tomorrow.",
+            False,
+        ),
+        (
+            "Summarize the latest news every morning",
+            "Summarize today's news",
+            "Today in the news: AI is taking over the world",
+            True,
+        ),
+        (
+            "Create a weather wallpaper every morning using the current weather",
+            "Paint a weather wallpaper using the current weather",
+            "https://khoj-generated-wallpaper.khoj.dev/user110/weathervane.webp",
+            True,
+        ),
+        (
+            "Let me know the election results once they are offically declared",
+            "What are the results of the elections? Has the winner been declared?",
+            "The election results has not been declared yet.",
+            False,
+        ),
+    ],
+)
+def test_decision_on_when_to_notify_scheduled_task_results(
+    chat_client, scheduling_query, executing_query, generated_response, expected_should_notify
+):
+    # Act
+    generated_should_notify = should_notify(scheduling_query, executing_query, generated_response)
+
+    # Assert
+    assert generated_should_notify == expected_should_notify
 
 
 # Helpers

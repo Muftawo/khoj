@@ -1,359 +1,107 @@
-# Standard Packages
 import concurrent.futures
-import math
-import time
-import yaml
-import logging
 import json
-from typing import List, Optional, Union, Any
+import logging
+import math
+import os
+import threading
+import time
+import uuid
+from typing import Any, Callable, List, Optional, Union
 
-# External Packages
-from fastapi import APIRouter, HTTPException, Header, Request
-from sentence_transformers import util
+import cron_descriptor
+import pytz
+from apscheduler.job import Job
+from apscheduler.triggers.cron import CronTrigger
+from asgiref.sync import sync_to_async
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi.requests import Request
+from fastapi.responses import Response
+from starlette.authentication import has_required_scope, requires
 
-# Internal Packages
-from khoj.configure import configure_processor, configure_server
-from khoj.search_type import image_search, text_search
+from khoj.configure import initialize_content
+from khoj.database.adapters import (
+    AutomationAdapters,
+    ConversationAdapters,
+    EntryAdapters,
+    get_user_photo,
+    get_user_search_model_or_default,
+)
+from khoj.database.models import ChatModelOptions, KhojUser, SpeechToTextModelOptions
+from khoj.processor.conversation.anthropic.anthropic_chat import (
+    extract_questions_anthropic,
+)
+from khoj.processor.conversation.offline.chat_model import extract_questions_offline
+from khoj.processor.conversation.offline.whisper import transcribe_audio_offline
+from khoj.processor.conversation.openai.gpt import extract_questions
+from khoj.processor.conversation.openai.whisper import transcribe_audio
+from khoj.routers.helpers import (
+    ApiUserRateLimiter,
+    CommonQueryParams,
+    ConversationCommandRateLimiter,
+    acreate_title_from_query,
+    schedule_automation,
+    update_telemetry_state,
+)
 from khoj.search_filter.date_filter import DateFilter
 from khoj.search_filter.file_filter import FileFilter
 from khoj.search_filter.word_filter import WordFilter
-from khoj.utils.config import TextSearchModel
-from khoj.utils.helpers import timer
-from khoj.utils.rawconfig import (
-    ContentConfig,
-    FullConfig,
-    ProcessorConfig,
-    SearchConfig,
-    SearchResponse,
-    TextContentConfig,
-    OpenAIProcessorConfig,
-    GithubContentConfig,
-    NotionContentConfig,
-    ConversationProcessorConfig,
-)
-from khoj.utils.helpers import resolve_absolute_path
+from khoj.search_type import text_search
+from khoj.utils import state
+from khoj.utils.config import OfflineChatProcessorModel
+from khoj.utils.helpers import ConversationCommand, is_none_or_empty, timer
+from khoj.utils.rawconfig import LocationData, SearchResponse
 from khoj.utils.state import SearchType
-from khoj.utils import state, constants
-from khoj.utils.yaml import save_config_to_file_updated_state
-from fastapi.responses import StreamingResponse, Response
-from khoj.routers.helpers import perform_chat_checks, generate_chat_response, update_telemetry_state
-from khoj.processor.conversation.openai.gpt import extract_questions
-from khoj.processor.conversation.gpt4all.chat_model import extract_questions_offline
-from fastapi.requests import Request
-
 
 # Initialize Router
 api = APIRouter()
 logger = logging.getLogger(__name__)
-
-# If it's a demo instance, prevent updating any of the configuration.
-if not state.demo:
-
-    def _initialize_config():
-        if state.config is None:
-            state.config = FullConfig()
-            state.config.search_type = SearchConfig.parse_obj(constants.default_config["search-type"])
-        if state.processor_config is None:
-            state.processor_config = configure_processor(state.config.processor)
-
-    @api.get("/config/data", response_model=FullConfig)
-    def get_config_data():
-        return state.config
-
-    @api.post("/config/data")
-    async def set_config_data(
-        request: Request,
-        updated_config: FullConfig,
-        client: Optional[str] = None,
-    ):
-        state.config = updated_config
-        with open(state.config_file, "w") as outfile:
-            yaml.dump(yaml.safe_load(state.config.json(by_alias=True)), outfile)
-            outfile.close()
-
-        configuration_update_metadata = dict()
-
-        if state.config.content_type is not None:
-            configuration_update_metadata["github"] = state.config.content_type.github is not None
-            configuration_update_metadata["notion"] = state.config.content_type.notion is not None
-            configuration_update_metadata["org"] = state.config.content_type.org is not None
-            configuration_update_metadata["pdf"] = state.config.content_type.pdf is not None
-            configuration_update_metadata["markdown"] = state.config.content_type.markdown is not None
-            configuration_update_metadata["plugins"] = state.config.content_type.plugins is not None
-
-        if state.config.processor is not None:
-            configuration_update_metadata["conversation_processor"] = state.config.processor.conversation is not None
-
-        update_telemetry_state(
-            request=request,
-            telemetry_type="api",
-            api="set_config",
-            client=client,
-            metadata=configuration_update_metadata,
-        )
-        return state.config
-
-    @api.post("/config/data/content_type/github", status_code=200)
-    async def set_content_config_github_data(
-        request: Request,
-        updated_config: Union[GithubContentConfig, None],
-        client: Optional[str] = None,
-    ):
-        _initialize_config()
-
-        if not state.config.content_type:
-            state.config.content_type = ContentConfig(**{"github": updated_config})
-        else:
-            state.config.content_type.github = updated_config
-
-        update_telemetry_state(
-            request=request,
-            telemetry_type="api",
-            api="set_content_config",
-            client=client,
-            metadata={"content_type": "github"},
-        )
-
-        try:
-            save_config_to_file_updated_state()
-            return {"status": "ok"}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-
-    @api.post("/config/data/content_type/notion", status_code=200)
-    async def set_content_config_notion_data(
-        request: Request,
-        updated_config: Union[NotionContentConfig, None],
-        client: Optional[str] = None,
-    ):
-        _initialize_config()
-
-        if not state.config.content_type:
-            state.config.content_type = ContentConfig(**{"notion": updated_config})
-        else:
-            state.config.content_type.notion = updated_config
-
-        update_telemetry_state(
-            request=request,
-            telemetry_type="api",
-            api="set_content_config",
-            client=client,
-            metadata={"content_type": "notion"},
-        )
-
-        try:
-            save_config_to_file_updated_state()
-            return {"status": "ok"}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-
-    @api.post("/delete/config/data/content_type/{content_type}", status_code=200)
-    async def remove_content_config_data(
-        request: Request,
-        content_type: str,
-        client: Optional[str] = None,
-    ):
-        if not state.config or not state.config.content_type:
-            return {"status": "ok"}
-
-        update_telemetry_state(
-            request=request,
-            telemetry_type="api",
-            api="delete_content_config",
-            client=client,
-            metadata={"content_type": content_type},
-        )
-
-        if state.config.content_type:
-            state.config.content_type[content_type] = None
-
-        if content_type == "github":
-            state.content_index.github = None
-        elif content_type == "notion":
-            state.content_index.notion = None
-        elif content_type == "plugins":
-            state.content_index.plugins = None
-        elif content_type == "pdf":
-            state.content_index.pdf = None
-        elif content_type == "markdown":
-            state.content_index.markdown = None
-        elif content_type == "org":
-            state.content_index.org = None
-
-        try:
-            save_config_to_file_updated_state()
-            return {"status": "ok"}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-
-    @api.post("/delete/config/data/processor/conversation/openai", status_code=200)
-    async def remove_processor_conversation_config_data(
-        request: Request,
-        client: Optional[str] = None,
-    ):
-        if (
-            not state.config
-            or not state.config.processor
-            or not state.config.processor.conversation
-            or not state.config.processor.conversation.openai
-        ):
-            return {"status": "ok"}
-
-        state.config.processor.conversation.openai = None
-        state.processor_config = configure_processor(state.config.processor, state.processor_config)
-
-        update_telemetry_state(
-            request=request,
-            telemetry_type="api",
-            api="delete_processor_openai_config",
-            client=client,
-            metadata={"processor_conversation_type": "openai"},
-        )
-
-        try:
-            save_config_to_file_updated_state()
-            return {"status": "ok"}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-
-    @api.post("/config/data/content_type/{content_type}", status_code=200)
-    async def set_content_config_data(
-        request: Request,
-        content_type: str,
-        updated_config: Union[TextContentConfig, None],
-        client: Optional[str] = None,
-    ):
-        _initialize_config()
-
-        if not state.config.content_type:
-            state.config.content_type = ContentConfig(**{content_type: updated_config})
-        else:
-            state.config.content_type[content_type] = updated_config
-
-        update_telemetry_state(
-            request=request,
-            telemetry_type="api",
-            api="set_content_config",
-            client=client,
-            metadata={"content_type": content_type},
-        )
-
-        try:
-            save_config_to_file_updated_state()
-            return {"status": "ok"}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-
-    @api.post("/config/data/processor/conversation/openai", status_code=200)
-    async def set_processor_openai_config_data(
-        request: Request,
-        updated_config: Union[OpenAIProcessorConfig, None],
-        client: Optional[str] = None,
-    ):
-        _initialize_config()
-
-        if not state.config.processor or not state.config.processor.conversation:
-            default_config = constants.default_config
-            default_conversation_logfile = resolve_absolute_path(
-                default_config["processor"]["conversation"]["conversation-logfile"]  # type: ignore
-            )
-            conversation_logfile = resolve_absolute_path(default_conversation_logfile)
-            state.config.processor = ProcessorConfig(conversation=ConversationProcessorConfig(conversation_logfile=conversation_logfile))  # type: ignore
-
-        assert state.config.processor.conversation is not None
-        state.config.processor.conversation.openai = updated_config
-        state.processor_config = configure_processor(state.config.processor, state.processor_config)
-
-        update_telemetry_state(
-            request=request,
-            telemetry_type="api",
-            api="set_processor_config",
-            client=client,
-            metadata={"processor_conversation_type": "conversation"},
-        )
-
-        try:
-            save_config_to_file_updated_state()
-            return {"status": "ok"}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-
-    @api.post("/config/data/processor/conversation/enable_offline_chat", status_code=200)
-    async def set_processor_enable_offline_chat_config_data(
-        request: Request,
-        enable_offline_chat: bool,
-        client: Optional[str] = None,
-    ):
-        _initialize_config()
-
-        if not state.config.processor or not state.config.processor.conversation:
-            default_config = constants.default_config
-            default_conversation_logfile = resolve_absolute_path(
-                default_config["processor"]["conversation"]["conversation-logfile"]  # type: ignore
-            )
-            conversation_logfile = resolve_absolute_path(default_conversation_logfile)
-            state.config.processor = ProcessorConfig(conversation=ConversationProcessorConfig(conversation_logfile=conversation_logfile))  # type: ignore
-
-        assert state.config.processor.conversation is not None
-        state.config.processor.conversation.enable_offline_chat = enable_offline_chat
-        state.processor_config = configure_processor(state.config.processor, state.processor_config)
-
-        update_telemetry_state(
-            request=request,
-            telemetry_type="api",
-            api="set_processor_config",
-            client=client,
-            metadata={"processor_conversation_type": f"{'enable' if enable_offline_chat else 'disable'}_local_llm"},
-        )
-
-        try:
-            save_config_to_file_updated_state()
-            return {"status": "ok"}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-
-
-# Create Routes
-@api.get("/config/data/default")
-def get_default_config_data():
-    return constants.default_config
-
-
-@api.get("/config/types", response_model=List[str])
-def get_config_types():
-    """Get configured content types"""
-    if state.config is None or state.config.content_type is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Content types not configured. Configure at least one content type on server and restart it.",
-        )
-
-    configured_content_types = state.config.content_type.dict(exclude_none=True)
-    return [
-        search_type.value
-        for search_type in SearchType
-        if (
-            search_type.value in configured_content_types
-            and getattr(state.content_index, search_type.value) is not None
-        )
-        or ("plugins" in configured_content_types and search_type.name in configured_content_types["plugins"])
-        or search_type == SearchType.All
-    ]
+conversation_command_rate_limiter = ConversationCommandRateLimiter(
+    trial_rate_limit=2, subscribed_rate_limit=100, slug="command"
+)
 
 
 @api.get("/search", response_model=List[SearchResponse])
+@requires(["authenticated"])
 async def search(
     q: str,
     request: Request,
+    common: CommonQueryParams,
     n: Optional[int] = 5,
     t: Optional[SearchType] = SearchType.All,
     r: Optional[bool] = False,
-    score_threshold: Optional[Union[float, None]] = None,
+    max_distance: Optional[Union[float, None]] = None,
     dedupe: Optional[bool] = True,
-    client: Optional[str] = None,
-    user_agent: Optional[str] = Header(None),
-    referer: Optional[str] = Header(None),
-    host: Optional[str] = Header(None),
+):
+    user = request.user.object
+
+    results = await execute_search(
+        user=user,
+        q=q,
+        n=n,
+        t=t,
+        r=r,
+        max_distance=max_distance,
+        dedupe=dedupe,
+    )
+
+    update_telemetry_state(
+        request=request,
+        telemetry_type="api",
+        api="search",
+        **common.__dict__,
+    )
+
+    return results
+
+
+async def execute_search(
+    user: KhojUser,
+    q: str,
+    n: Optional[int] = 5,
+    t: Optional[SearchType] = SearchType.All,
+    r: Optional[bool] = False,
+    max_distance: Optional[Union[float, None]] = None,
+    dedupe: Optional[bool] = True,
 ):
     start_time = time.time()
 
@@ -362,224 +110,68 @@ async def search(
     if q is None or q == "":
         logger.warning(f"No query param (q) passed in API call to initiate search")
         return results
-    if not state.search_models or not any(state.search_models.__dict__.values()):
-        logger.warning(f"No search models loaded. Configure a search model before initiating search")
-        return results
 
     # initialize variables
     user_query = q.strip()
     results_count = n or 5
-    score_threshold = score_threshold if score_threshold is not None else -math.inf
+    max_distance = max_distance or math.inf
     search_futures: List[concurrent.futures.Future] = []
 
     # return cached results, if available
-    query_cache_key = f"{user_query}-{n}-{t}-{r}-{score_threshold}-{dedupe}"
-    if query_cache_key in state.query_cache:
-        logger.debug(f"Return response from query cache")
-        return state.query_cache[query_cache_key]
+    if user:
+        query_cache_key = f"{user_query}-{n}-{t}-{r}-{max_distance}-{dedupe}"
+        if query_cache_key in state.query_cache[user.uuid]:
+            logger.debug(f"Return response from query cache")
+            return state.query_cache[user.uuid][query_cache_key]
 
     # Encode query with filter terms removed
     defiltered_query = user_query
     for filter in [DateFilter(), WordFilter(), FileFilter()]:
-        defiltered_query = filter.defilter(user_query)
+        defiltered_query = filter.defilter(defiltered_query)
 
     encoded_asymmetric_query = None
-    if t == SearchType.All or t != SearchType.Image:
-        text_search_models: List[TextSearchModel] = [
-            model for model in state.search_models.__dict__.values() if isinstance(model, TextSearchModel)
-        ]
-        if text_search_models:
-            with timer("Encoding query took", logger=logger):
-                encoded_asymmetric_query = util.normalize_embeddings(
-                    text_search_models[0].bi_encoder.encode(
-                        [defiltered_query],
-                        convert_to_tensor=True,
-                        device=state.device,
-                    )
-                )
+    if t != SearchType.Image:
+        with timer("Encoding query took", logger=logger):
+            search_model = await sync_to_async(get_user_search_model_or_default)(user)
+            encoded_asymmetric_query = state.embeddings_model[search_model.name].embed_query(defiltered_query)
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        if (t == SearchType.Org or t == SearchType.All) and state.content_index.org and state.search_models.text_search:
-            # query org-mode notes
-            search_futures += [
-                executor.submit(
-                    text_search.query,
-                    user_query,
-                    state.search_models.text_search,
-                    state.content_index.org,
-                    question_embedding=encoded_asymmetric_query,
-                    rank_results=r or False,
-                    score_threshold=score_threshold,
-                    dedupe=dedupe or True,
-                )
-            ]
-
-        if (
-            (t == SearchType.Markdown or t == SearchType.All)
-            and state.content_index.markdown
-            and state.search_models.text_search
-        ):
+        if t in [
+            SearchType.All,
+            SearchType.Org,
+            SearchType.Markdown,
+            SearchType.Github,
+            SearchType.Notion,
+            SearchType.Plaintext,
+            SearchType.Pdf,
+        ]:
             # query markdown notes
             search_futures += [
                 executor.submit(
                     text_search.query,
+                    user,
                     user_query,
-                    state.search_models.text_search,
-                    state.content_index.markdown,
+                    t,
                     question_embedding=encoded_asymmetric_query,
-                    rank_results=r or False,
-                    score_threshold=score_threshold,
-                    dedupe=dedupe or True,
-                )
-            ]
-
-        if (
-            (t == SearchType.Github or t == SearchType.All)
-            and state.content_index.github
-            and state.search_models.text_search
-        ):
-            # query github issues
-            search_futures += [
-                executor.submit(
-                    text_search.query,
-                    user_query,
-                    state.search_models.text_search,
-                    state.content_index.github,
-                    question_embedding=encoded_asymmetric_query,
-                    rank_results=r or False,
-                    score_threshold=score_threshold,
-                    dedupe=dedupe or True,
-                )
-            ]
-
-        if (t == SearchType.Pdf or t == SearchType.All) and state.content_index.pdf and state.search_models.text_search:
-            # query pdf files
-            search_futures += [
-                executor.submit(
-                    text_search.query,
-                    user_query,
-                    state.search_models.text_search,
-                    state.content_index.pdf,
-                    question_embedding=encoded_asymmetric_query,
-                    rank_results=r or False,
-                    score_threshold=score_threshold,
-                    dedupe=dedupe or True,
-                )
-            ]
-
-        if (t == SearchType.Image) and state.content_index.image and state.search_models.image_search:
-            # query images
-            search_futures += [
-                executor.submit(
-                    image_search.query,
-                    user_query,
-                    results_count,
-                    state.search_models.image_search,
-                    state.content_index.image,
-                    score_threshold=score_threshold,
-                )
-            ]
-
-        if (
-            (t == SearchType.All or t in SearchType)
-            and state.content_index.plugins
-            and state.search_models.plugin_search
-        ):
-            # query specified plugin type
-            # Get plugin content, search model for specified search type, or the first one if none specified
-            plugin_search = state.search_models.plugin_search.get(t.value) or next(
-                iter(state.search_models.plugin_search.values())
-            )
-            plugin_content = state.content_index.plugins.get(t.value) or next(
-                iter(state.content_index.plugins.values())
-            )
-            search_futures += [
-                executor.submit(
-                    text_search.query,
-                    user_query,
-                    plugin_search,
-                    plugin_content,
-                    question_embedding=encoded_asymmetric_query,
-                    rank_results=r or False,
-                    score_threshold=score_threshold,
-                    dedupe=dedupe or True,
-                )
-            ]
-
-        if (
-            (t == SearchType.Notion or t == SearchType.All)
-            and state.content_index.notion
-            and state.search_models.text_search
-        ):
-            # query notion pages
-            search_futures += [
-                executor.submit(
-                    text_search.query,
-                    user_query,
-                    state.search_models.text_search,
-                    state.content_index.notion,
-                    question_embedding=encoded_asymmetric_query,
-                    rank_results=r or False,
-                    score_threshold=score_threshold,
-                    dedupe=dedupe or True,
-                )
-            ]
-
-        if (
-            (t == SearchType.Plaintext or t == SearchType.All)
-            and state.content_index.plaintext
-            and state.search_models.text_search
-        ):
-            # query plaintext files
-            search_futures += [
-                executor.submit(
-                    text_search.query,
-                    user_query,
-                    state.search_models.text_search,
-                    state.content_index.plaintext,
-                    question_embedding=encoded_asymmetric_query,
-                    rank_results=r or False,
-                    score_threshold=score_threshold,
-                    dedupe=dedupe or True,
+                    max_distance=max_distance,
                 )
             ]
 
         # Query across each requested content types in parallel
         with timer("Query took", logger):
             for search_future in concurrent.futures.as_completed(search_futures):
-                if t == SearchType.Image and state.content_index.image:
-                    hits = await search_future.result()
-                    output_directory = constants.web_directory / "images"
-                    # Collate results
-                    results += image_search.collate_results(
-                        hits,
-                        image_names=state.content_index.image.image_names,
-                        output_directory=output_directory,
-                        image_files_url="/static/images",
-                        count=results_count,
-                    )
-                else:
-                    hits, entries = await search_future.result()
-                    # Collate results
-                    results += text_search.collate_results(hits, entries, results_count)
+                hits = await search_future.result()
+                # Collate results
+                results += text_search.collate_results(hits, dedupe=dedupe)
 
-            # Sort results across all content types and take top results
-            results = sorted(results, key=lambda x: float(x.score), reverse=True)[:results_count]
+                # Sort results across all content types and take top results
+                results = text_search.rerank_and_sort_results(
+                    results, query=defiltered_query, rank_results=r, search_model_name=search_model.name
+                )[:results_count]
 
     # Cache results
-    state.query_cache[query_cache_key] = results
-
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="search",
-        client=client,
-        user_agent=user_agent,
-        referer=referer,
-        host=host,
-    )
-
-    state.previous_query = user_query
+    if user:
+        state.query_cache[user.uuid][query_cache_key] = results
 
     end_time = time.time()
     logger.debug(f"🔍 Search took: {end_time - start_time:.3f} seconds")
@@ -588,21 +180,20 @@ async def search(
 
 
 @api.get("/update")
+@requires(["authenticated"])
 def update(
     request: Request,
+    common: CommonQueryParams,
     t: Optional[SearchType] = None,
     force: Optional[bool] = False,
-    client: Optional[str] = None,
-    user_agent: Optional[str] = Header(None),
-    referer: Optional[str] = Header(None),
-    host: Optional[str] = Header(None),
 ):
+    user = request.user.object
     if not state.config:
         error_msg = f"🚨 Khoj is not configured.\nConfigure it via http://localhost:42110/config, plugins or by editing {state.config_file}."
         logger.warning(error_msg)
         raise HTTPException(status_code=500, detail=error_msg)
     try:
-        configure_server(state.config, regenerate=force or False, search_type=t)
+        initialize_content(regenerate=force, search_type=t, user=user)
     except Exception as e:
         error_msg = f"🚨 Failed to update server via API: {e}"
         logger.error(error_msg, exc_info=True)
@@ -611,148 +202,392 @@ def update(
         components = []
         if state.search_models:
             components.append("Search models")
-        if state.content_index:
-            components.append("Content index")
-        if state.processor_config:
-            components.append("Conversation processor")
         components_msg = ", ".join(components)
-        logger.info(f"📬 {components_msg} updated via API")
+        logger.info(f"📪 {components_msg} updated via API")
 
     update_telemetry_state(
         request=request,
         telemetry_type="api",
         api="update",
-        client=client,
-        user_agent=user_agent,
-        referer=referer,
-        host=host,
+        **common.__dict__,
     )
 
     return {"status": "ok", "message": "khoj reloaded"}
 
 
-@api.get("/chat/history")
-def chat_history(
+@api.post("/transcribe")
+@requires(["authenticated"])
+async def transcribe(
     request: Request,
-    client: Optional[str] = None,
-    user_agent: Optional[str] = Header(None),
-    referer: Optional[str] = Header(None),
-    host: Optional[str] = Header(None),
+    common: CommonQueryParams,
+    file: UploadFile = File(...),
+    rate_limiter_per_minute=Depends(
+        ApiUserRateLimiter(requests=1, subscribed_requests=10, window=60, slug="transcribe_minute")
+    ),
+    rate_limiter_per_day=Depends(
+        ApiUserRateLimiter(requests=10, subscribed_requests=600, window=60 * 60 * 24, slug="transcribe_day")
+    ),
 ):
-    perform_chat_checks()
+    user: KhojUser = request.user.object
+    audio_filename = f"{user.uuid}-{str(uuid.uuid4())}.webm"
+    user_message: str = None
 
-    # Load Conversation History
-    meta_log = {}
-    if state.processor_config.conversation:
-        meta_log = state.processor_config.conversation.meta_log
+    # If the file is too large, return an unprocessable entity error
+    if file.size > 10 * 1024 * 1024:
+        logger.warning(f"Audio file too large to transcribe. Audio file size: {file.size}. Exceeds 10Mb limit.")
+        return Response(content="Audio size larger than 10Mb limit", status_code=422)
 
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="chat",
-        client=client,
-        user_agent=user_agent,
-        referer=referer,
-        host=host,
-    )
+    # Transcribe the audio from the request
+    try:
+        # Store the audio from the request in a temporary file
+        audio_data = await file.read()
+        with open(audio_filename, "wb") as audio_file_writer:
+            audio_file_writer.write(audio_data)
+        audio_file = open(audio_filename, "rb")
 
-    return {"status": "ok", "response": meta_log.get("chat", [])}
+        # Send the audio data to the Whisper API
+        speech_to_text_config = await ConversationAdapters.get_speech_to_text_config()
+        if not speech_to_text_config:
+            # If the user has not configured a speech to text model, return an unsupported on server error
+            status_code = 501
+        elif state.openai_client and speech_to_text_config.model_type == SpeechToTextModelOptions.ModelType.OPENAI:
+            speech2text_model = speech_to_text_config.model_name
+            user_message = await transcribe_audio(audio_file, speech2text_model, client=state.openai_client)
+        elif speech_to_text_config.model_type == SpeechToTextModelOptions.ModelType.OFFLINE:
+            speech2text_model = speech_to_text_config.model_name
+            user_message = await transcribe_audio_offline(audio_filename, speech2text_model)
+    finally:
+        # Close and Delete the temporary audio file
+        audio_file.close()
+        os.remove(audio_filename)
 
-
-@api.get("/chat", response_class=Response)
-async def chat(
-    request: Request,
-    q: str,
-    n: Optional[int] = 5,
-    client: Optional[str] = None,
-    stream: Optional[bool] = False,
-    user_agent: Optional[str] = Header(None),
-    referer: Optional[str] = Header(None),
-    host: Optional[str] = Header(None),
-) -> Response:
-    perform_chat_checks()
-    compiled_references, inferred_queries = await extract_references_and_questions(request, q, (n or 5))
-
-    # Get the (streamed) chat response from the LLM of choice.
-    llm_response = generate_chat_response(
-        q,
-        meta_log=state.processor_config.conversation.meta_log,
-        compiled_references=compiled_references,
-        inferred_queries=inferred_queries,
-    )
-
-    if llm_response is None:
-        return Response(content=llm_response, media_type="text/plain", status_code=500)
-
-    if stream:
-        return StreamingResponse(llm_response, media_type="text/event-stream", status_code=200)
-
-    # Get the full response from the generator if the stream is not requested.
-    aggregated_gpt_response = ""
-    while True:
-        try:
-            aggregated_gpt_response += next(llm_response)
-        except StopIteration:
-            break
-
-    actual_response = aggregated_gpt_response.split("### compiled references:")[0]
-
-    response_obj = {"response": actual_response, "context": compiled_references}
+    if user_message is None:
+        return Response(status_code=status_code or 500)
 
     update_telemetry_state(
         request=request,
         telemetry_type="api",
-        api="chat",
-        client=client,
-        user_agent=user_agent,
-        referer=referer,
-        host=host,
+        api="transcribe",
+        **common.__dict__,
     )
 
-    return Response(content=json.dumps(response_obj), media_type="application/json", status_code=200)
+    # Return the spoken text
+    content = json.dumps({"text": user_message})
+    return Response(content=content, media_type="application/json", status_code=200)
 
 
 async def extract_references_and_questions(
     request: Request,
+    meta_log: dict,
     q: str,
     n: int,
+    d: float,
+    conversation_commands: List[ConversationCommand] = [ConversationCommand.Default],
+    location_data: LocationData = None,
+    send_status_func: Optional[Callable] = None,
 ):
-    # Load Conversation History
-    meta_log = state.processor_config.conversation.meta_log
+    user = request.user.object if request.user.is_authenticated else None
 
     # Initialize Variables
-    conversation_type = "general" if q.startswith("@general") else "notes"
     compiled_references: List[Any] = []
     inferred_queries: List[str] = []
 
-    if state.content_index is None:
-        logger.warn(
-            "No content index loaded, so cannot extract references from knowledge base. Please configure your data sources and update the index to chat with your notes."
+    if (
+        not ConversationCommand.Notes in conversation_commands
+        and not ConversationCommand.Default in conversation_commands
+    ):
+        return compiled_references, inferred_queries, q
+
+    if not await sync_to_async(EntryAdapters.user_has_entries)(user=user):
+        logger.debug("No documents in knowledge base. Use a Khoj client to sync and chat with your docs.")
+        return compiled_references, inferred_queries, q
+
+    # Extract filter terms from user message
+    defiltered_query = q
+    for filter in [DateFilter(), WordFilter(), FileFilter()]:
+        defiltered_query = filter.defilter(defiltered_query)
+    filters_in_query = q.replace(defiltered_query, "").strip()
+
+    using_offline_chat = False
+
+    # Infer search queries from user message
+    with timer("Extracting search queries took", logger):
+        # If we've reached here, either the user has enabled offline chat or the openai model is enabled.
+        conversation_config = await ConversationAdapters.aget_default_conversation_config()
+
+        if conversation_config.model_type == ChatModelOptions.ModelType.OFFLINE:
+            using_offline_chat = True
+            chat_model = conversation_config.chat_model
+            max_tokens = conversation_config.max_prompt_size
+            if state.offline_chat_processor_config is None:
+                state.offline_chat_processor_config = OfflineChatProcessorModel(chat_model, max_tokens)
+
+            loaded_model = state.offline_chat_processor_config.loaded_model
+
+            inferred_queries = extract_questions_offline(
+                defiltered_query,
+                loaded_model=loaded_model,
+                conversation_log=meta_log,
+                should_extract_questions=True,
+                location_data=location_data,
+                max_prompt_size=conversation_config.max_prompt_size,
+            )
+        elif conversation_config.model_type == ChatModelOptions.ModelType.OPENAI:
+            openai_chat_config = conversation_config.openai_config
+            api_key = openai_chat_config.api_key
+            chat_model = conversation_config.chat_model
+            inferred_queries = extract_questions(
+                defiltered_query,
+                model=chat_model,
+                api_key=api_key,
+                conversation_log=meta_log,
+                location_data=location_data,
+                max_tokens=conversation_config.max_prompt_size,
+            )
+        elif conversation_config.model_type == ChatModelOptions.ModelType.ANTHROPIC:
+            api_key = conversation_config.openai_config.api_key
+            chat_model = conversation_config.chat_model
+            inferred_queries = extract_questions_anthropic(
+                defiltered_query,
+                model=chat_model,
+                api_key=api_key,
+                conversation_log=meta_log,
+                location_data=location_data,
+            )
+
+    # Collate search results as context for GPT
+    with timer("Searching knowledge base took", logger):
+        result_list = []
+        logger.info(f"🔍 Searching knowledge base with queries: {inferred_queries}")
+        if send_status_func:
+            inferred_queries_str = "\n- " + "\n- ".join(inferred_queries)
+            await send_status_func(f"**🔍 Searching Documents for:** {inferred_queries_str}")
+        for query in inferred_queries:
+            n_items = min(n, 3) if using_offline_chat else n
+            result_list.extend(
+                await execute_search(
+                    user,
+                    f"{query} {filters_in_query}",
+                    n=n_items,
+                    t=SearchType.All,
+                    r=True,
+                    max_distance=d,
+                    dedupe=False,
+                )
+            )
+        result_list = text_search.deduplicated_search_responses(result_list)
+        compiled_references = [item.additional["compiled"] for item in result_list]
+
+    return compiled_references, inferred_queries, defiltered_query
+
+
+@api.get("/health", response_class=Response)
+@requires(["authenticated"], status_code=200)
+def health_check(request: Request) -> Response:
+    response_obj = {"email": request.user.object.email}
+    return Response(content=json.dumps(response_obj), media_type="application/json", status_code=200)
+
+
+@api.get("/v1/user", response_class=Response)
+@requires(["authenticated"])
+def user_info(request: Request) -> Response:
+    # Get user information
+    user: KhojUser = request.user.object
+    user_picture = get_user_photo(user=user)
+    is_active = has_required_scope(request, ["premium"])
+    has_documents = EntryAdapters.user_has_entries(user=user)
+
+    # Collect user information in a dictionary
+    user_info = {
+        "email": user.email,
+        "username": user.username,
+        "photo": user_picture,
+        "is_active": is_active,
+        "has_documents": has_documents,
+    }
+
+    # Return user information as a JSON response
+    return Response(content=json.dumps(user_info), media_type="application/json", status_code=200)
+
+
+@api.get("/automations", response_class=Response)
+@requires(["authenticated"])
+def get_automations(request: Request) -> Response:
+    user: KhojUser = request.user.object
+
+    # Collate all automations created by user that are still active
+    automations_info = [automation_info for automation_info in AutomationAdapters.get_automations_metadata(user)]
+
+    # Return tasks information as a JSON response
+    return Response(content=json.dumps(automations_info), media_type="application/json", status_code=200)
+
+
+@api.delete("/automation", response_class=Response)
+@requires(["authenticated"])
+def delete_automation(request: Request, automation_id: str) -> Response:
+    user: KhojUser = request.user.object
+
+    try:
+        automation_info = AutomationAdapters.delete_automation(user, automation_id)
+    except ValueError:
+        return Response(status_code=204)
+
+    # Return deleted automation information as a JSON response
+    return Response(content=json.dumps(automation_info), media_type="application/json", status_code=200)
+
+
+@api.post("/automation", response_class=Response)
+@requires(["authenticated"])
+async def post_automation(
+    request: Request,
+    q: str,
+    crontime: str,
+    city: Optional[str] = None,
+    region: Optional[str] = None,
+    country: Optional[str] = None,
+    timezone: Optional[str] = None,
+) -> Response:
+    user: KhojUser = request.user.object
+
+    # Perform validation checks
+    if is_none_or_empty(q) or is_none_or_empty(crontime):
+        return Response(content="A query and crontime is required", status_code=400)
+    if not cron_descriptor.get_description(crontime):
+        return Response(content="Invalid crontime", status_code=400)
+
+    # Normalize query parameters
+    # Add /automated_task prefix to query if not present
+    q = q.strip()
+    if not q.startswith("/automated_task"):
+        query_to_run = f"/automated_task {q}"
+    # Normalize crontime for AP Scheduler CronTrigger
+    crontime = crontime.strip()
+    if len(crontime.split(" ")) > 5:
+        # Truncate crontime to 5 fields
+        crontime = " ".join(crontime.split(" ")[:5])
+    # Convert crontime to standard unix crontime
+    crontime = crontime.replace("?", "*")
+    if crontime == "* * * * *":
+        return Response(content="Invalid crontime. Please create a more specific schedule.", status_code=400)
+    subject = await acreate_title_from_query(q)
+
+    # Create new Conversation Session associated with this new task
+    conversation = await ConversationAdapters.acreate_conversation_session(user, request.user.client_app)
+
+    calling_url = request.url.replace(query=f"{request.url.query}&conversation_id={conversation.id}")
+
+    # Schedule automation with query_to_run, timezone, subject directly provided by user
+    try:
+        # Use the query to run as the scheduling request if the scheduling request is unset
+        automation = await schedule_automation(query_to_run, subject, crontime, timezone, q, user, calling_url)
+    except Exception as e:
+        logger.error(f"Error creating automation {q} for {user.email}: {e}", exc_info=True)
+        return Response(
+            content=f"Unable to create automation. Ensure the automation doesn't already exist.",
+            media_type="text/plain",
+            status_code=500,
         )
-        return compiled_references, inferred_queries
 
-    if conversation_type == "notes":
-        # Infer search queries from user message
-        with timer("Extracting search queries took", logger):
-            # If we've reached here, either the user has enabled offline chat or the openai model is enabled.
-            if state.processor_config.conversation.enable_offline_chat:
-                loaded_model = state.processor_config.conversation.gpt4all_model.loaded_model
-                inferred_queries = extract_questions_offline(
-                    q, loaded_model=loaded_model, conversation_log=meta_log, should_extract_questions=False
-                )
-            elif state.processor_config.conversation.openai_model:
-                api_key = state.processor_config.conversation.openai_model.api_key
-                chat_model = state.processor_config.conversation.openai_model.chat_model
-                inferred_queries = extract_questions(q, model=chat_model, api_key=api_key, conversation_log=meta_log)
+    # Collate info about the created user automation
+    automation_info = AutomationAdapters.get_automation_metadata(user, automation)
 
-        # Collate search results as context for GPT
-        with timer("Searching knowledge base took", logger):
-            result_list = []
-            for query in inferred_queries:
-                n_items = min(n, 3) if state.processor_config.conversation.enable_offline_chat else n
-                result_list.extend(
-                    await search(query, request=request, n=n_items, r=True, score_threshold=-5.0, dedupe=False)
-                )
-            compiled_references = [item.additional["compiled"] for item in result_list]
+    # Return information about the created automation as a JSON response
+    return Response(content=json.dumps(automation_info), media_type="application/json", status_code=200)
 
-    return compiled_references, inferred_queries
+
+@api.post("/trigger/automation", response_class=Response)
+@requires(["authenticated"])
+def trigger_manual_job(
+    request: Request,
+    automation_id: str,
+):
+    user: KhojUser = request.user.object
+
+    # Check, get automation to edit
+    try:
+        automation: Job = AutomationAdapters.get_automation(user, automation_id)
+    except ValueError as e:
+        logger.error(f"Error triggering automation {automation_id} for {user.email}: {e}", exc_info=True)
+        return Response(content="Invalid automation", status_code=403)
+
+    # Trigger the job without waiting for the result.
+    scheduled_chat_func = automation.func
+
+    # Run the function in a separate thread
+    thread = threading.Thread(target=scheduled_chat_func, args=automation.args, kwargs=automation.kwargs)
+    thread.start()
+
+    return Response(content="Automation triggered", status_code=200)
+
+
+@api.put("/automation", response_class=Response)
+@requires(["authenticated"])
+def edit_job(
+    request: Request,
+    automation_id: str,
+    q: Optional[str],
+    subject: Optional[str],
+    crontime: Optional[str],
+    city: Optional[str] = None,
+    region: Optional[str] = None,
+    country: Optional[str] = None,
+    timezone: Optional[str] = None,
+) -> Response:
+    user: KhojUser = request.user.object
+
+    # Perform validation checks
+    if is_none_or_empty(q) or is_none_or_empty(subject) or is_none_or_empty(crontime):
+        return Response(content="A query, subject and crontime is required", status_code=400)
+    if not cron_descriptor.get_description(crontime):
+        return Response(content="Invalid crontime", status_code=400)
+
+    # Check, get automation to edit
+    try:
+        automation: Job = AutomationAdapters.get_automation(user, automation_id)
+    except ValueError as e:
+        return Response(content="Invalid automation", status_code=403)
+
+    # Normalize query parameters
+    # Add /automated_task prefix to query if not present
+    q = q.strip()
+    if not q.startswith("/automated_task"):
+        query_to_run = f"/automated_task {q}"
+    # Normalize crontime for AP Scheduler CronTrigger
+    crontime = crontime.strip()
+    if len(crontime.split(" ")) > 5:
+        # Truncate crontime to 5 fields
+        crontime = " ".join(crontime.split(" ")[:5])
+    # Convert crontime to standard unix crontime
+    crontime = crontime.replace("?", "*")
+
+    # Construct updated automation metadata
+    automation_metadata = json.loads(automation.name)
+    automation_metadata["scheduling_request"] = q
+    automation_metadata["query_to_run"] = query_to_run
+    automation_metadata["subject"] = subject.strip()
+    automation_metadata["crontime"] = crontime
+
+    # Modify automation with updated query, subject
+    automation.modify(
+        name=json.dumps(automation_metadata),
+        kwargs={
+            "query_to_run": query_to_run,
+            "subject": subject,
+            "scheduling_request": q,
+            "user": user,
+            "calling_url": request.url,
+        },
+    )
+
+    # Reschedule automation if crontime updated
+    user_timezone = pytz.timezone(timezone)
+    trigger = CronTrigger.from_crontab(crontime, user_timezone)
+    if automation.trigger != trigger:
+        automation.reschedule(trigger=trigger)
+
+    # Collate info about the updated user automation
+    automation = AutomationAdapters.get_automation(user, automation.id)
+    automation_info = AutomationAdapters.get_automation_metadata(user, automation)
+
+    # Return modified automation information as a JSON response
+    return Response(content=json.dumps(automation_info), media_type="application/json", status_code=200)

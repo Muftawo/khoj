@@ -1,22 +1,25 @@
-import { App, Notice, PluginSettingTab, request, Setting } from 'obsidian';
+import { App, Notice, PluginSettingTab, Setting, TFile } from 'obsidian';
 import Khoj from 'src/main';
+import { canConnectToBackend, getBackendStatusMessage, updateContentIndex } from './utils';
 
 export interface KhojSetting {
-    enableOfflineChat: boolean;
-    openaiApiKey: string;
     resultsCount: number;
     khojUrl: string;
+    khojApiKey: string;
     connectedToBackend: boolean;
     autoConfigure: boolean;
+    lastSync: Map<TFile, number>;
+    userEmail: string;
 }
 
 export const DEFAULT_SETTINGS: KhojSetting = {
-    enableOfflineChat: false,
     resultsCount: 6,
-    khojUrl: 'http://127.0.0.1:42110',
+    khojUrl: 'https://app.khoj.dev',
+    khojApiKey: '',
     connectedToBackend: false,
     autoConfigure: true,
-    openaiApiKey: '',
+    lastSync: new Map(),
+    userEmail: '',
 }
 
 export class KhojSettingTab extends PluginSettingTab {
@@ -32,7 +35,15 @@ export class KhojSettingTab extends PluginSettingTab {
         containerEl.empty();
 
         // Add notice whether able to connect to khoj backend or not
-        containerEl.createEl('small', { text: this.getBackendStatusMessage() });
+        let backendStatusEl = containerEl.createEl('small', {
+            text: getBackendStatusMessage(
+                this.plugin.settings.connectedToBackend,
+                this.plugin.settings.userEmail,
+                this.plugin.settings.khojUrl,
+                this.plugin.settings.khojApiKey
+            )}
+        );
+        let backendStatusMessage: string = '';
 
         // Add khoj settings configurable from the plugin settings tab
         new Setting(containerEl)
@@ -41,27 +52,30 @@ export class KhojSettingTab extends PluginSettingTab {
             .addText(text => text
                 .setValue(`${this.plugin.settings.khojUrl}`)
                 .onChange(async (value) => {
-                    this.plugin.settings.khojUrl = value.trim();
+                    this.plugin.settings.khojUrl = value.trim().replace(/\/$/, '');
+                    ({
+                        connectedToBackend: this.plugin.settings.connectedToBackend,
+                        userEmail: this.plugin.settings.userEmail,
+                        statusMessage: backendStatusMessage,
+                    } = await canConnectToBackend(this.plugin.settings.khojUrl, this.plugin.settings.khojApiKey));
+
                     await this.plugin.saveSettings();
-                    containerEl.firstElementChild?.setText(this.getBackendStatusMessage());
+                    backendStatusEl.setText(backendStatusMessage);
                 }));
         new Setting(containerEl)
-            .setName('OpenAI API Key')
-            .setDesc('Use OpenAI for Khoj Chat with your API key.')
+            .setName('Khoj API Key')
+            .setDesc('Use Khoj Cloud with your Khoj API Key')
             .addText(text => text
-                .setValue(`${this.plugin.settings.openaiApiKey}`)
+                .setValue(`${this.plugin.settings.khojApiKey}`)
                 .onChange(async (value) => {
-                    this.plugin.settings.openaiApiKey = value.trim();
+                    this.plugin.settings.khojApiKey = value.trim();
+                    ({
+                        connectedToBackend: this.plugin.settings.connectedToBackend,
+                        userEmail: this.plugin.settings.userEmail,
+                        statusMessage: backendStatusMessage,
+                    } = await canConnectToBackend(this.plugin.settings.khojUrl, this.plugin.settings.khojApiKey));
                     await this.plugin.saveSettings();
-                }));
-        new Setting(containerEl)
-            .setName('Enable Offline Chat')
-            .setDesc('Chat privately without an internet connection. Enabling this will use offline chat even if OpenAI is configured.')
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.enableOfflineChat)
-                .onChange(async (value) => {
-                    this.plugin.settings.enableOfflineChat = value;
-                    await this.plugin.saveSettings();
+                    backendStatusEl.setText(backendStatusMessage);
                 }));
         new Setting(containerEl)
             .setName('Results Count')
@@ -75,8 +89,8 @@ export class KhojSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
         new Setting(containerEl)
-            .setName('Auto Configure')
-            .setDesc('Automatically configure the Khoj backend.')
+            .setName('Auto Sync')
+            .setDesc('Automatically index your vault with Khoj.')
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.autoConfigure)
                 .onChange(async (value) => {
@@ -85,7 +99,7 @@ export class KhojSettingTab extends PluginSettingTab {
                 }));
         let indexVaultSetting = new Setting(containerEl);
         indexVaultSetting
-            .setName('Index Vault')
+            .setName('Force Sync')
             .setDesc('Manually force Khoj to re-index your Obsidian Vault.')
             .addButton(button => button
                 .setButtonText('Update')
@@ -118,8 +132,9 @@ export class KhojSettingTab extends PluginSettingTab {
                     }, 300);
                     this.plugin.registerInterval(progress_indicator);
 
-                    await request(`${this.plugin.settings.khojUrl}/api/update?t=markdown&force=true&client=obsidian`);
-                    await request(`${this.plugin.settings.khojUrl}/api/update?t=pdf&force=true&client=obsidian`);
+                    this.plugin.settings.lastSync = await updateContentIndex(
+                        this.app.vault, this.plugin.settings, this.plugin.settings.lastSync, true
+                    );
                     new Notice('✅ Updated Khoj index.');
 
                     // Reset button once index is updated
@@ -129,11 +144,5 @@ export class KhojSettingTab extends PluginSettingTab {
                     indexVaultSetting = indexVaultSetting.setDisabled(false);
                 })
             );
-    }
-
-    getBackendStatusMessage() {
-        return !this.plugin.settings.connectedToBackend
-            ? '❗Disconnected from Khoj backend. Ensure Khoj backend is running and Khoj URL is correctly set below.'
-            : '✅ Connected to Khoj backend.';
     }
 }

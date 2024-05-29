@@ -1,31 +1,61 @@
-# Standard Packages
 from __future__ import annotations  # to avoid quoting type hints
-from collections import OrderedDict
+
 import datetime
+import logging
+import os
+import platform
+import random
+import uuid
+from collections import OrderedDict
+from enum import Enum
 from importlib import import_module
 from importlib.metadata import version
-import logging
+from itertools import islice
 from os import path
-import os
 from pathlib import Path
-import platform
-import sys
 from time import perf_counter
-import torch
-from typing import Optional, Union, TYPE_CHECKING
-import uuid
+from typing import TYPE_CHECKING, Optional, Union
+from urllib.parse import urlparse
 
-# Internal Packages
+import psutil
+import requests
+import torch
+from asgiref.sync import sync_to_async
+from magika import Magika
+
 from khoj.utils import constants
 
-
 if TYPE_CHECKING:
-    # External Packages
-    from sentence_transformers import SentenceTransformer, CrossEncoder
+    from sentence_transformers import CrossEncoder, SentenceTransformer
 
-    # Internal Packages
     from khoj.utils.models import BaseEncoder
     from khoj.utils.rawconfig import AppConfig
+
+
+# Initialize Magika for file type identification
+magika = Magika()
+
+
+class AsyncIteratorWrapper:
+    def __init__(self, obj):
+        self._it = iter(obj)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            value = await self.next_async()
+        except StopAsyncIteration:
+            return
+        return value
+
+    @sync_to_async
+    def next_async(self):
+        try:
+            return next(self._it)
+        except StopIteration:
+            raise StopAsyncIteration
 
 
 def is_none_or_empty(item):
@@ -65,6 +95,36 @@ def merge_dicts(priority_dict: dict, default_dict: dict):
     return merged_dict
 
 
+def get_file_type(file_type: str, file_content: bytes) -> tuple[str, str]:
+    "Get file type from file mime type"
+
+    # Extract encoding from file_type
+    encoding = file_type.split("=")[1].strip().lower() if ";" in file_type else None
+    file_type = file_type.split(";")[0].strip() if ";" in file_type else file_type
+
+    # Infer content type from reading file content
+    try:
+        content_group = magika.identify_bytes(file_content).output.group
+    except Exception:
+        # Fallback to using just file type if content type cannot be inferred
+        content_group = "unknown"
+
+    if file_type in ["text/markdown"]:
+        return "markdown", encoding
+    elif file_type in ["text/org"]:
+        return "org", encoding
+    elif file_type in ["application/pdf"]:
+        return "pdf", encoding
+    elif file_type in ["image/jpeg"]:
+        return "jpeg", encoding
+    elif file_type in ["image/png"]:
+        return "png", encoding
+    elif content_group in ["code", "text"]:
+        return "plaintext", encoding
+    else:
+        return "other", encoding
+
+
 def load_model(
     model_name: str, model_type, model_dir=None, device: str = None
 ) -> Union[BaseEncoder, SentenceTransformer, CrossEncoder]:
@@ -87,11 +147,6 @@ def load_model(
             model.save(model_path)
 
     return model
-
-
-def is_pyinstaller_app():
-    "Returns true if the app is running from Native GUI created by PyInstaller"
-    return getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
 
 
 def get_class_by_name(name: str) -> object:
@@ -180,6 +235,10 @@ def get_server_id():
     return server_id
 
 
+def telemetry_disabled(app_config: AppConfig):
+    return not app_config or not app_config.should_log_telemetry
+
+
 def log_telemetry(
     telemetry_type: str,
     api: str = None,
@@ -189,13 +248,15 @@ def log_telemetry(
 ):
     """Log basic app usage telemetry like client, os, api called"""
     # Do not log usage telemetry, if telemetry is disabled via app config
-    if not app_config or not app_config.should_log_telemetry:
+    if telemetry_disabled(app_config):
         return []
+
+    if properties.get("server_id") is None:
+        properties["server_id"] = get_server_id()
 
     # Populate telemetry data to log
     request_body = {
         "telemetry_type": telemetry_type,
-        "server_id": get_server_id(),
         "server_version": version("khoj-assistant"),
         "os": platform.system(),
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -210,3 +271,142 @@ def log_telemetry(
 
     # Log telemetry data to telemetry endpoint
     return request_body
+
+
+def get_device_memory() -> int:
+    """Get device memory in GB"""
+    device = get_device()
+    if device.type == "cuda":
+        return torch.cuda.get_device_properties(device).total_memory
+    elif device.type == "mps":
+        return torch.mps.driver_allocated_memory()
+    else:
+        return psutil.virtual_memory().total
+
+
+def get_device() -> torch.device:
+    """Get device to run model on"""
+    if torch.cuda.is_available():
+        # Use CUDA GPU
+        return torch.device("cuda:0")
+    elif torch.backends.mps.is_available():
+        # Use Apple M1 Metal Acceleration
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
+
+
+class ConversationCommand(str, Enum):
+    Default = "default"
+    General = "general"
+    Notes = "notes"
+    Help = "help"
+    Online = "online"
+    Webpage = "webpage"
+    Image = "image"
+    Automation = "automation"
+    AutomatedTask = "automated_task"
+
+
+command_descriptions = {
+    ConversationCommand.General: "Only talk about information that relies on Khoj's general knowledge, not your personal knowledge base.",
+    ConversationCommand.Notes: "Only talk about information that is available in your knowledge base.",
+    ConversationCommand.Default: "The default command when no command specified. It intelligently auto-switches between general and notes mode.",
+    ConversationCommand.Online: "Search for information on the internet.",
+    ConversationCommand.Webpage: "Get information from webpage links provided by you.",
+    ConversationCommand.Image: "Generate images by describing your imagination in words.",
+    ConversationCommand.Automation: "Automatically run your query at a specified time or interval.",
+    ConversationCommand.Help: "Display a help message with all available commands and other metadata.",
+}
+
+tool_descriptions_for_llm = {
+    ConversationCommand.Default: "To use a mix of your internal knowledge and the user's personal knowledge, or if you don't entirely understand the query.",
+    ConversationCommand.General: "To use when you can answer the question without any outside information or personal knowledge",
+    ConversationCommand.Notes: "To search the user's personal knowledge base. Especially helpful if the question expects context from the user's notes or documents.",
+    ConversationCommand.Online: "To search for the latest, up-to-date information from the internet. Note: **Questions about Khoj should always use this data source**",
+    ConversationCommand.Webpage: "To use if the user has directly provided the webpage urls or you are certain of the webpage urls to read.",
+}
+
+mode_descriptions_for_llm = {
+    ConversationCommand.Image: "Use this if the user is requesting an image or visual response to their query.",
+    ConversationCommand.Automation: "Use this if the user is requesting a response at a scheduled date or time.",
+    ConversationCommand.Default: "Use this if the other response modes don't seem to fit the query.",
+}
+
+
+class ImageIntentType(Enum):
+    """
+    Chat message intent by Khoj for image responses.
+    Marks the schema used to reference image in chat messages
+    """
+
+    # Images as Inline PNG
+    TEXT_TO_IMAGE = "text-to-image"
+    # Images as URLs
+    TEXT_TO_IMAGE2 = "text-to-image2"
+    # Images as Inline WebP
+    TEXT_TO_IMAGE_V3 = "text-to-image-v3"
+
+
+def generate_random_name():
+    # List of adjectives and nouns to choose from
+    adjectives = [
+        "happy",
+        "serendipitous",
+        "exuberant",
+        "calm",
+        "brave",
+        "scared",
+        "energetic",
+        "chivalrous",
+        "kind",
+        "suave",
+    ]
+    nouns = ["dog", "cat", "falcon", "whale", "turtle", "rabbit", "hamster", "snake", "spider", "elephant"]
+
+    # Select two random words from the lists
+    adjective = random.choice(adjectives)
+    noun = random.choice(nouns)
+
+    # Combine the words to form a name
+    name = f"{adjective} {noun}"
+
+    return name
+
+
+def batcher(iterable, max_n):
+    "Split an iterable into chunks of size max_n"
+    it = iter(iterable)
+    while True:
+        chunk = list(islice(it, max_n))
+        if not chunk:
+            return
+        yield (x for x in chunk if x is not None)
+
+
+def is_env_var_true(env_var: str, default: str = "false") -> bool:
+    """Get state of boolean environment variable"""
+    return os.getenv(env_var, default).lower() == "true"
+
+
+def in_debug_mode():
+    """Check if Khoj is running in debug mode.
+    Set KHOJ_DEBUG environment variable to true to enable debug mode."""
+    return is_env_var_true("KHOJ_DEBUG")
+
+
+def is_valid_url(url: str) -> bool:
+    """Check if a string is a valid URL"""
+    try:
+        result = urlparse(url.strip())
+        return all([result.scheme, result.netloc])
+    except:
+        return False
+
+
+def is_internet_connected():
+    try:
+        response = requests.head("https://www.google.com")
+        return response.status_code == 200
+    except:
+        return False

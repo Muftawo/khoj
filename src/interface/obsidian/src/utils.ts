@@ -1,4 +1,4 @@
-import { FileSystemAdapter, Notice, RequestUrlParam, request, Vault, Modal } from 'obsidian';
+import { FileSystemAdapter, Notice, Vault, Modal, TFile, request } from 'obsidian';
 import { KhojSetting } from 'src/settings'
 
 export function getVaultAbsolutePath(vault: Vault): string {
@@ -9,203 +9,131 @@ export function getVaultAbsolutePath(vault: Vault): string {
     return '';
 }
 
-type OpenAIType = null | {
-    "chat-model": string;
-    "api-key": string;
-};
-
-interface ProcessorData {
-    conversation: {
-      "conversation-logfile": string;
-      openai: OpenAIType;
-      "enable-offline-chat": boolean;
-    };
+function fileExtensionToMimeType (extension: string): string {
+    switch (extension) {
+        case 'pdf':
+            return 'application/pdf';
+        case 'png':
+            return 'image/png';
+        case 'jpg':
+        case 'jpeg':
+            return 'image/jpeg';
+        case 'md':
+        case 'markdown':
+            return 'text/markdown';
+        case 'org':
+            return 'text/org';
+        default:
+            return 'text/plain';
+    }
 }
 
-export async function configureKhojBackend(vault: Vault, setting: KhojSetting, notify: boolean = true) {
-    let vaultPath = getVaultAbsolutePath(vault);
-    let mdInVault = `${vaultPath}/**/*.md`;
-    let pdfInVault = `${vaultPath}/**/*.pdf`;
-    let khojConfigUrl = `${setting.khojUrl}/api/config/data`;
-
-    // Check if khoj backend is configured, note if cannot connect to backend
-    let khoj_already_configured = await request(khojConfigUrl)
-        .then(response => {
-            setting.connectedToBackend = true;
-            return response !== "null"
-        })
-        .catch(error => {
-            setting.connectedToBackend = false;
-            if (notify)
-                new Notice(`❗️Ensure Khoj backend is running and Khoj URL is pointing to it in the plugin settings.\n\n${error}`);
-        })
-    // Short-circuit configuring khoj if unable to connect to khoj backend
-    if (!setting.connectedToBackend) return;
-
-    // Set index name from the path of the current vault
-    let indexName = vaultPath.replace(/\//g, '_').replace(/\\/g, '_').replace(/ /g, '_').replace(/:/g, '_');
-    // Get default config fields from khoj backend
-    let defaultConfig = await request(`${khojConfigUrl}/default`).then(response => JSON.parse(response));
-    let khojDefaultMdIndexDirectory = getIndexDirectoryFromBackendConfig(defaultConfig["content-type"]["markdown"]["embeddings-file"]);
-    let khojDefaultPdfIndexDirectory = getIndexDirectoryFromBackendConfig(defaultConfig["content-type"]["pdf"]["embeddings-file"]);
-    let khojDefaultChatDirectory = getIndexDirectoryFromBackendConfig(defaultConfig["processor"]["conversation"]["conversation-logfile"]);
-    let khojDefaultChatModelName = defaultConfig["processor"]["conversation"]["openai"]["chat-model"];
-
-    // Get current config if khoj backend configured, else get default config from khoj backend
-    await request(khoj_already_configured ? khojConfigUrl : `${khojConfigUrl}/default`)
-        .then(response => JSON.parse(response))
-        .then(data => {
-            // If khoj backend not configured yet
-            if (!khoj_already_configured) {
-                // Create khoj content-type config with only markdown configured
-                data["content-type"] = {
-                    "markdown": {
-                        "input-filter": [mdInVault],
-                        "input-files": null,
-                        "embeddings-file": `${khojDefaultMdIndexDirectory}/${indexName}.pt`,
-                        "compressed-jsonl": `${khojDefaultMdIndexDirectory}/${indexName}.jsonl.gz`,
-                    }
-                }
-
-                const hasPdfFiles = app.vault.getFiles().some(file => file.extension === 'pdf');
-
-                if (hasPdfFiles) {
-                    data["content-type"]["pdf"] = {
-                        "input-filter": [pdfInVault],
-                        "input-files": null,
-                        "embeddings-file": `${khojDefaultPdfIndexDirectory}/${indexName}.pt`,
-                        "compressed-jsonl": `${khojDefaultPdfIndexDirectory}/${indexName}.jsonl.gz`,
-                    }
-                }
-            }
-            // Else if khoj config has no markdown content config
-            else if (!data["content-type"]["markdown"]) {
-                // Add markdown config to khoj content-type config
-                // Set markdown config to index markdown files in configured obsidian vault
-                data["content-type"]["markdown"] = {
-                    "input-filter": [mdInVault],
-                    "input-files": null,
-                    "embeddings-file": `${khojDefaultMdIndexDirectory}/${indexName}.pt`,
-                    "compressed-jsonl": `${khojDefaultMdIndexDirectory}/${indexName}.jsonl.gz`,
-                }
-            }
-            // Else if khoj is not configured to index markdown files in configured obsidian vault
-            else if (
-                data["content-type"]["markdown"]["input-files"] != null ||
-                data["content-type"]["markdown"]["input-filter"] == null ||
-                data["content-type"]["markdown"]["input-filter"].length != 1 ||
-                data["content-type"]["markdown"]["input-filter"][0] !== mdInVault) {
-                    // Update markdown config in khoj content-type config
-                    // Set markdown config to only index markdown files in configured obsidian vault
-                    let khojMdIndexDirectory = getIndexDirectoryFromBackendConfig(data["content-type"]["markdown"]["embeddings-file"]);
-                    data["content-type"]["markdown"] = {
-                        "input-filter": [mdInVault],
-                        "input-files": null,
-                        "embeddings-file": `${khojMdIndexDirectory}/${indexName}.pt`,
-                        "compressed-jsonl": `${khojMdIndexDirectory}/${indexName}.jsonl.gz`,
-                    }
-            }
-
-            if (khoj_already_configured && !data["content-type"]["pdf"]) {
-                const hasPdfFiles = app.vault.getFiles().some(file => file.extension === 'pdf');
-
-                if (hasPdfFiles) {
-                    data["content-type"]["pdf"] = {
-                        "input-filter": [pdfInVault],
-                        "input-files": null,
-                        "embeddings-file": `${khojDefaultPdfIndexDirectory}/${indexName}.pt`,
-                        "compressed-jsonl": `${khojDefaultPdfIndexDirectory}/${indexName}.jsonl.gz`,
-                    }
-                } else {
-                    data["content-type"]["pdf"] = null;
-                }
-            }
-            // Else if khoj is not configured to index pdf files in configured obsidian vault
-            else if (khoj_already_configured &&
-                (
-                    data["content-type"]["pdf"]["input-files"] != null ||
-                    data["content-type"]["pdf"]["input-filter"] == null ||
-                    data["content-type"]["pdf"]["input-filter"].length != 1 ||
-                    data["content-type"]["pdf"]["input-filter"][0] !== pdfInVault)) {
-
-                let hasPdfFiles = app.vault.getFiles().some(file => file.extension === 'pdf');
-
-                if (hasPdfFiles) {
-                    // Update pdf config in khoj content-type config
-                    // Set pdf config to only index pdf files in configured obsidian vault
-                    let khojPdfIndexDirectory = getIndexDirectoryFromBackendConfig(data["content-type"]["pdf"]["embeddings-file"]);
-                    data["content-type"]["pdf"] = {
-                        "input-filter": [pdfInVault],
-                        "input-files": null,
-                        "embeddings-file": `${khojPdfIndexDirectory}/${indexName}.pt`,
-                        "compressed-jsonl": `${khojPdfIndexDirectory}/${indexName}.jsonl.gz`,
-                    }
-                } else {
-                    data["content-type"]["pdf"] = null;
-                }
-            }
-
-            let conversationLogFile = data?.["processor"]?.["conversation"]?.["conversation-logfile"] ?? `${khojDefaultChatDirectory}/conversation.json`;
-
-            let processorData: ProcessorData = {
-                "conversation": {
-                    "conversation-logfile": conversationLogFile,
-                    "openai": null,
-                    "enable-offline-chat": setting.enableOfflineChat,
-                }
-            }
-
-            // If the Open AI API Key was configured in the plugin settings
-            if (!!setting.openaiApiKey) {
-
-                let openAIChatModel = data?.["processor"]?.["conversation"]?.["openai"]?.["chat-model"] ?? khojDefaultChatModelName;
-
-                processorData = {
-                    "conversation": {
-                        "conversation-logfile": conversationLogFile,
-                        "openai": {
-                            "chat-model": openAIChatModel,
-                            "api-key": setting.openaiApiKey,
-                        },
-                        "enable-offline-chat": setting.enableOfflineChat,
-                    },
-                }
-            }
-
-            // Set khoj processor config to conversation processor config
-            data["processor"] = processorData;
-
-            // Save updated config and refresh index on khoj backend
-            updateKhojBackend(setting.khojUrl, data);
-            if (!khoj_already_configured)
-                console.log(`Khoj: Created khoj backend config:\n${JSON.stringify(data)}`)
-            else
-                console.log(`Khoj: Updated khoj backend config:\n${JSON.stringify(data)}`)
-        })
-        .catch(error => {
-            if (notify)
-                new Notice(`❗️Failed to configure Khoj backend. Contact developer on Github.\n\nError: ${error}`);
-        })
+function filenameToMimeType (filename: TFile): string {
+    switch (filename.extension) {
+        case 'pdf':
+            return 'application/pdf';
+        case 'png':
+            return 'image/png';
+        case 'jpg':
+        case 'jpeg':
+            return 'image/jpeg';
+        case 'md':
+        case 'markdown':
+            return 'text/markdown';
+        case 'org':
+            return 'text/org';
+        default:
+            console.warn(`Unknown file type: ${filename.extension}. Defaulting to text/plain.`);
+            return 'text/plain';
+    }
 }
 
-export async function updateKhojBackend(khojUrl: string, khojConfig: Object) {
-    // POST khojConfig to khojConfigUrl
-    let requestContent: RequestUrlParam = {
-        url: `${khojUrl}/api/config/data`,
-        body: JSON.stringify(khojConfig),
-        method: 'POST',
-        contentType: 'application/json',
-    };
+export async function updateContentIndex(vault: Vault, setting: KhojSetting, lastSync: Map<TFile, number>, regenerate: boolean = false): Promise<Map<TFile, number>> {
+    // Get all markdown, pdf files in the vault
+    console.log(`Khoj: Updating Khoj content index...`)
+    const files = vault.getFiles().filter(file => file.extension === 'md' || file.extension === 'markdown' || file.extension === 'pdf');
+    const binaryFileTypes = ['pdf']
+    let countOfFilesToIndex = 0;
+    let countOfFilesToDelete = 0;
+    lastSync = lastSync.size > 0 ? lastSync : new Map<TFile, number>();
 
-    // Save khojConfig on khoj backend at khojConfigUrl
-    await request(requestContent)
-        // Refresh khoj search index after updating config
-        .then(_ => request(`${khojUrl}/api/update?t=markdown`))
-        .then(_ => request(`${khojUrl}/api/update?t=pdf`));
-}
+    // Add all files to index as multipart form data
+    const fileData = [];
+    for (const file of files) {
+        // Only push files that have been modified since last sync if not regenerating
+        if (!regenerate && file.stat.mtime < (lastSync.get(file) ?? 0)){
+            continue;
+        }
 
-function getIndexDirectoryFromBackendConfig(filepath: string) {
-    return filepath.split("/").slice(0, -1).join("/");
+        countOfFilesToIndex++;
+        const encoding = binaryFileTypes.includes(file.extension) ? "binary" : "utf8";
+        const mimeType = fileExtensionToMimeType(file.extension) + (encoding === "utf8" ? "; charset=UTF-8" : "");
+        const fileContent = encoding == 'binary' ? await vault.readBinary(file) : await vault.read(file);
+        fileData.push({blob: new Blob([fileContent], { type: mimeType }), path: file.path});
+    }
+
+    // Add any previously synced files to be deleted to multipart form data
+    let filesToDelete: TFile[] = [];
+    for (const lastSyncedFile of lastSync.keys()) {
+        if (!files.includes(lastSyncedFile)) {
+            countOfFilesToDelete++;
+            let fileObj = new Blob([""], { type: filenameToMimeType(lastSyncedFile) });
+            fileData.push({blob: fileObj, path: lastSyncedFile.path});
+            filesToDelete.push(lastSyncedFile);
+        }
+    }
+
+    // Iterate through all indexable files in vault, 1000 at a time
+    let responses: string[]  = [];
+    let error_message = null;
+    for (let i = 0; i < fileData.length; i += 1000) {
+        const filesGroup = fileData.slice(i, i + 1000);
+        const formData = new FormData();
+        filesGroup.forEach(fileItem => { formData.append('files', fileItem.blob, fileItem.path) });
+        // Call Khoj backend to update index with all markdown, pdf files
+        const response = await fetch(`${setting.khojUrl}/api/v1/index/update?force=${regenerate}&client=obsidian`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${setting.khojApiKey}`,
+            },
+            body: formData,
+        });
+
+        if (!response.ok) {
+            if (response.status === 429) {
+                error_message = `❗️Failed to sync your content with Khoj server. Requests were throttled. Upgrade your subscription or try again later.`;
+                break;
+            } else if (response.status === 404) {
+                error_message = `❗️Could not connect to Khoj server. Ensure you can connect to it.`;
+                break;
+            } else {
+                error_message = `❗️Failed to sync your content with Khoj server. Raise issue on Khoj Discord or Github\nError: ${response.statusText}`;
+            }
+        } else {
+            responses.push(await response.text());
+        }
+    }
+
+    // Update last sync time for each successfully indexed file
+   files
+    .filter(file => responses.find(response => response.includes(file.path)))
+    .reduce((newSync, file) => {
+        newSync.set(file, new Date().getTime());
+        return newSync;
+    }, lastSync);
+
+    // Remove files that were deleted from last sync
+    filesToDelete
+    .filter(file => responses.find(response => response.includes(file.path)))
+    .forEach(file => lastSync.delete(file));
+
+    if (error_message) {
+        new Notice(error_message);
+    } else {
+        console.log(`✅ Refreshed Khoj content index. Updated: ${countOfFilesToIndex} files, Deleted: ${countOfFilesToDelete} files.`);
+    }
+
+    return lastSync;
 }
 
 export async function createNote(name: string, newLeaf = false): Promise<void> {
@@ -228,7 +156,7 @@ export async function createNote(name: string, newLeaf = false): Promise<void> {
       console.error('Khoj: Could not create note.\n' + (e as any).message);
       throw e
     }
-  }
+}
 
 export async function createNoteAndCloseModal(query: string, modal: Modal, opt?: { newLeaf: boolean }): Promise<void> {
     try {
@@ -239,4 +167,51 @@ export async function createNoteAndCloseModal(query: string, modal: Modal, opt?:
         return
     }
     modal.close();
+}
+
+export async function canConnectToBackend(
+    khojUrl: string,
+    khojApiKey: string,
+    showNotice: boolean = false
+): Promise<{ connectedToBackend: boolean; statusMessage: string, userEmail: string }> {
+    let connectedToBackend = false;
+    let userEmail: string = '';
+
+    if (!!khojUrl) {
+        let headers  = !!khojApiKey ? { "Authorization": `Bearer ${khojApiKey}` } : undefined;
+        await request({ url: `${khojUrl}/api/health`, method: "GET", headers: headers })
+        .then(response => {
+            connectedToBackend = true;
+            userEmail = JSON.parse(response)?.email;
+        })
+        .catch(error => {
+            connectedToBackend = false;
+            console.log(`Khoj connection error:\n\n${error}`);
+        });
+    }
+
+    let statusMessage: string = getBackendStatusMessage(connectedToBackend, userEmail, khojUrl, khojApiKey);
+    if (showNotice) new Notice(statusMessage);
+    return { connectedToBackend, statusMessage, userEmail };
+}
+
+export function getBackendStatusMessage(
+    connectedToServer: boolean,
+    userEmail: string,
+    khojUrl: string,
+    khojApiKey: string
+): string {
+    // Welcome message with default settings. Khoj cloud always expects an API key.
+    if (!khojApiKey && khojUrl === 'https://app.khoj.dev')
+        return `🌈 Welcome to Khoj! Get your API key from ${khojUrl}/config#clients and set it in the Khoj plugin settings on Obsidian`;
+
+    if (!connectedToServer)
+        return `❗️Could not connect to Khoj at ${khojUrl}. Ensure your can access it`;
+    else if (!userEmail)
+        return `✅ Connected to Khoj. ❗️Get a valid API key from ${khojUrl}/config#clients to log in`;
+    else if (userEmail === 'default@example.com')
+        // Logged in as default user in anonymous mode
+        return `✅ Signed in to Khoj`;
+    else
+        return `✅ Signed in to Khoj as ${userEmail}`;
 }
